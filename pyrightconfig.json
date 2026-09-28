@@ -1,0 +1,16 @@
+{
+  "include": [
+    "main.py",
+    "realdebrid.py",
+    "remotefile.py",
+    "remotezip.py",
+    "ui",
+    "workers"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    }
+  ]
+}
