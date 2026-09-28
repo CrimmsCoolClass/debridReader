@@ -8,7 +8,10 @@ class PageWorker(QObject):
     finished = Signal(int, bytes)
     failed = Signal(int, str)
 
-    def __init__(self, archive):
+    def __init__(
+        self,
+        archive,
+    ):
         super().__init__()
 
         self.archive = archive
@@ -35,9 +38,9 @@ class PageWorker(QObject):
                 "request started"
             )
 
-            # -------------------------------------------------
-            # Get the underlying RemoteFile.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Get underlying RemoteFile
+            # ------------------------------------------------
 
             remote_file = getattr(
                 self.archive,
@@ -45,30 +48,26 @@ class PageWorker(QObject):
                 None,
             )
 
-            # -------------------------------------------------
-            # Record RemoteFile statistics before the read.
-            #
-            # Use individual integer/float variables instead
-            # of keeping a possibly-None dictionary around.
-            # This also keeps the LSP happy.
-            # -------------------------------------------------
-
             if remote_file is not None:
 
+                before_info = (
+                    remote_file.get_cache_info()
+                )
+
                 before_range_requests = (
-                    remote_file.get_cache_info()[
+                    before_info[
                         "range_requests"
                     ]
                 )
 
                 before_downloaded_bytes = (
-                    remote_file.get_cache_info()[
+                    before_info[
                         "downloaded_bytes"
                     ]
                 )
 
                 before_request_time = (
-                    remote_file.get_cache_info()[
+                    before_info[
                         "request_time"
                     ]
                 )
@@ -79,9 +78,9 @@ class PageWorker(QObject):
                 before_downloaded_bytes = 0
                 before_request_time = 0.0
 
-            # -------------------------------------------------
-            # Read the actual page.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Read page
+            # ------------------------------------------------
 
             data = self.archive.read_file(
                 filename
@@ -92,9 +91,32 @@ class PageWorker(QObject):
                 f"({len(data) / 1024 / 1024:.2f} MiB)"
             )
 
-            # -------------------------------------------------
-            # Record RemoteFile statistics after the read.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Print physical ZIP/RAR location
+            # ------------------------------------------------
+
+            file_info = getattr(
+                self.archive,
+                "last_file_info",
+                None,
+            )
+
+            if file_info is not None:
+
+                print(
+                    f"[ZIP] Page {page_number + 1} | "
+                    f"RAR offset: "
+                    f"{file_info['rar_offset']:,} | "
+                    f"Compressed: "
+                    f"{file_info['compressed_size'] / 1024 / 1024:.2f} MiB | "
+                    f"RAR blocks: "
+                    f"{file_info['first_block']} -> "
+                    f"{file_info['last_block']}"
+                )
+
+            # ------------------------------------------------
+            # RemoteFile statistics
+            # ------------------------------------------------
 
             if remote_file is not None:
 
@@ -103,15 +125,22 @@ class PageWorker(QObject):
                 )
 
                 after_range_requests = (
-                    after_info["range_requests"]
+                    after_info[
+                        "range_requests"
+                    ]
                 )
 
                 after_downloaded_bytes = (
-                    after_info["downloaded_bytes"]
+                    after_info[
+                        "downloaded_bytes"
+                    ]
                 )
 
                 after_request_time = (
-                    after_info["request_time"]
+                    after_info[
+                        "request_time"
+                    ]
+
                 )
 
                 range_requests = (
@@ -139,9 +168,9 @@ class PageWorker(QObject):
                     f"{request_time * 1000:.2f} ms"
                 )
 
-            # -------------------------------------------------
-            # Deliver the page to the reader.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Return page
+            # ------------------------------------------------
 
             self.finished.emit(
                 page_number,

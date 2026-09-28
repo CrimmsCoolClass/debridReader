@@ -857,6 +857,12 @@ class OpenVolumeWorker(QObject):
                             rar.list_cbzs()
                         )
 
+                        self.rar_index_cache[
+                                cache_key
+                        ] = entries
+
+                        self._save_rar_index_cache()
+
                         scan_elapsed = (
                             time.perf_counter()
                             - scan_start

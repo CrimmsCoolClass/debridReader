@@ -4,7 +4,12 @@ import zipfile
 
 
 class RemoteCBZ(io.RawIOBase):
-    def __init__(self, remote_file, offset, size):
+    def __init__(
+        self,
+        remote_file,
+        offset,
+        size,
+    ):
         self.remote_file = remote_file
         self.offset = offset
         self.size = size
@@ -17,7 +22,10 @@ class RemoteCBZ(io.RawIOBase):
             return b""
 
         if size < 0:
-            size = self.size - self.position
+            size = (
+                self.size
+                - self.position
+            )
 
         size = min(
             size,
@@ -25,26 +33,39 @@ class RemoteCBZ(io.RawIOBase):
         )
 
         self.remote_file.seek(
-            self.offset + self.position
+            self.offset
+            + self.position
         )
 
-        data = self.remote_file.read(size)
+        data = self.remote_file.read(
+            size
+        )
 
         self.position += len(data)
 
         return data
 
-    def seek(self, offset, whence=0):
+    def seek(
+        self,
+        offset,
+        whence=0,
+    ):
         """Move within the CBZ."""
 
         if whence == 0:
             new_position = offset
 
         elif whence == 1:
-            new_position = self.position + offset
+            new_position = (
+                self.position
+                + offset
+            )
 
         elif whence == 2:
-            new_position = self.size + offset
+            new_position = (
+                self.size
+                + offset
+            )
 
         else:
             raise ValueError(
@@ -61,8 +82,6 @@ class RemoteCBZ(io.RawIOBase):
         return self.position
 
     def tell(self):
-        """Return the current position."""
-
         return self.position
 
     def readable(self):
@@ -93,6 +112,12 @@ class RemoteCBZArchive:
             self.file
         )
 
+        self.last_file_info = None
+
+        # Cache the page list so read_file() can determine
+        # which pages are coming next.
+        self.pages = self.list_pages()
+
     def list_files(self):
         """Return the names of all files in the CBZ."""
 
@@ -118,11 +143,223 @@ class RemoteCBZArchive:
 
         return pages
 
-    def read_file(self, filename):
+    def _get_compressed_location(
+        self,
+        filename,
+    ):
+        """
+        Determine the physical location of a ZIP entry
+        inside the outer RAR.
+
+        _orig_compress_start is a private zipfile attribute,
+        but it gives us the exact compressed-data position
+        that Python is already using internally.
+        """
+
+        zip_info = self.zip.getinfo(
+            filename
+        )
+
+        with self.zip.open(
+            filename
+        ) as file:
+            compressed_start = getattr(
+                file,
+                "_orig_compress_start",
+                None,
+            )
+
+        if compressed_start is None:
+            return None
+
+        rar_offset = (
+            self.offset
+            + compressed_start
+        )
+
+        compressed_size = (
+            zip_info.compress_size
+        )
+
+        if compressed_size <= 0:
+            return None
+
+        compressed_end = (
+            rar_offset
+            + compressed_size
+            - 1
+        )
+
+        block_size = (
+            self.remote_file.block_size
+        )
+
+        first_block = (
+            rar_offset
+            // block_size
+        )
+
+        last_block = (
+            compressed_end
+            // block_size
+        )
+
+        return {
+            "filename": filename,
+            "zip_offset": compressed_start,
+            "rar_offset": rar_offset,
+            "compressed_size": compressed_size,
+            "first_block": first_block,
+            "last_block": last_block,
+        }
+
+    def _prefetch_page(
+        self,
+        filename,
+    ):
+        """
+        Start downloading all RemoteFile blocks needed
+        by one page.
+
+        This function does not wait for the downloads.
+        """
+
+        file_info = (
+            self._get_compressed_location(
+                filename
+            )
+        )
+
+        if file_info is None:
+            return
+
+        block_numbers = range(
+            file_info["first_block"],
+            file_info["last_block"] + 1,
+        )
+
+        self.remote_file.prefetch_blocks(
+            block_numbers
+        )
+
+    def _prefetch_upcoming_pages(
+        self,
+        filename,
+        count=2,
+    ):
+        """
+        Prefetch the next two pages.
+
+        The downloads happen asynchronously, so this
+        function returns immediately.
+        """
+
+        try:
+            page_index = self.pages.index(
+                filename
+            )
+        except ValueError:
+            return
+
+        start = page_index + 1
+
+        end = min(
+            start + count,
+            len(self.pages),
+        )
+
+        for index in range(
+            start,
+            end,
+        ):
+            self._prefetch_page(
+                self.pages[index]
+            )
+
+    def read_file(
+        self,
+        filename,
+    ):
         """Read and decompress a file from the CBZ."""
 
-        with self.zip.open(filename) as file:
-            return file.read()
+        with self.zip.open(
+            filename
+        ) as file:
+
+            compressed_start = getattr(
+                file,
+                "_orig_compress_start",
+                None,
+            )
+
+            zip_info = self.zip.getinfo(
+                filename
+            )
+
+            if compressed_start is not None:
+
+                rar_offset = (
+                    self.offset
+                    + compressed_start
+                )
+
+                compressed_size = (
+                    zip_info.compress_size
+                )
+
+                if compressed_size > 0:
+
+                    compressed_end = (
+                        rar_offset
+                        + compressed_size
+                        - 1
+                    )
+
+                    block_size = (
+                        self.remote_file.block_size
+                    )
+
+                    first_block = (
+                        rar_offset
+                        // block_size
+                    )
+
+                    last_block = (
+                        compressed_end
+                        // block_size
+                    )
+
+                    self.last_file_info = {
+                        "filename": filename,
+                        "zip_offset": (
+                            compressed_start
+                        ),
+                        "rar_offset": rar_offset,
+                        "compressed_size": (
+                            compressed_size
+                        ),
+                        "first_block": (
+                            first_block
+                        ),
+                        "last_block": (
+                            last_block
+                        ),
+                    }
+
+            data = file.read()
+
+        # The current page is now available.
+        #
+        # Start fetching the next two pages in the
+        # background. We deliberately do this AFTER
+        # reading the current page so the current page
+        # remains the highest priority operation.
+        self._prefetch_upcoming_pages(
+            filename,
+            count=2,
+        )
+
+        return data
 
     def close(self):
         self.zip.close()
@@ -150,18 +387,27 @@ class RemoteRARArchive:
     FLAG_SALT = 0x0400
     FLAG_LONG_BLOCK = 0x8000
 
-    def __init__(self, remote_file):
+    def __init__(
+        self,
+        remote_file,
+    ):
         self.remote_file = remote_file
         self.entries = []
 
         self._scan()
 
-    def _read_at(self, offset, size):
+    def _read_at(
+        self,
+        offset,
+        size,
+    ):
         """Read a section of the remote RAR."""
 
         self.remote_file.seek(offset)
 
-        data = self.remote_file.read(size)
+        data = self.remote_file.read(
+            size
+        )
 
         if len(data) != size:
             raise IOError(
@@ -186,28 +432,31 @@ class RemoteRARArchive:
             return ""
 
         if unicode_flag:
-            # RAR Unicode filenames contain an ANSI name
-            # followed by RAR's Unicode encoding.
 
             zero = filename_data.find(
                 b"\x00"
             )
 
             if zero >= 0:
-                ansi_name = filename_data[
-                    :zero
-                ]
+
+                ansi_name = (
+                    filename_data[:zero]
+                )
 
                 try:
                     return ansi_name.decode(
                         "utf-8"
                     )
+
                 except UnicodeDecodeError:
+
                     try:
                         return ansi_name.decode(
                             "cp437"
                         )
+
                     except UnicodeDecodeError:
+
                         return ansi_name.decode(
                             "latin-1",
                             errors="replace",
@@ -222,6 +471,7 @@ class RemoteRARArchive:
                 return filename_data.decode(
                     encoding
                 )
+
             except UnicodeDecodeError:
                 pass
 
@@ -297,7 +547,8 @@ class RemoteRARArchive:
                 )[0]
 
                 data_offset = (
-                    position + head_size
+                    position
+                    + head_size
                 )
 
                 # Files larger than 4 GiB have high
@@ -334,7 +585,8 @@ class RemoteRARArchive:
                     name_offset = 32
 
                 name_end = (
-                    name_offset + name_size
+                    name_offset
+                    + name_size
                 )
 
                 if name_end > len(header):
@@ -346,12 +598,14 @@ class RemoteRARArchive:
                     name_offset:name_end
                 ]
 
-                filename = self._decode_filename(
-                    filename_data,
-                    bool(
-                        head_flags
-                        & self.FLAG_UNICODE
-                    ),
+                filename = (
+                    self._decode_filename(
+                        filename_data,
+                        bool(
+                            head_flags
+                            & self.FLAG_UNICODE
+                        ),
+                    )
                 )
 
                 entry = {
@@ -364,23 +618,33 @@ class RemoteRARArchive:
                     "flags": head_flags,
                 }
 
-                self.entries.append(entry)
+                self.entries.append(
+                    entry
+                )
 
                 # RAR entries may be split across
-                # multiple volumes. Those aren't usable
-                # as standalone CBZ files.
+                # multiple volumes.
                 if head_flags & 0x0001:
-                    entry["split_before"] = True
+                    entry[
+                        "split_before"
+                    ] = True
                 else:
-                    entry["split_before"] = False
+                    entry[
+                        "split_before"
+                    ] = False
 
                 if head_flags & 0x0002:
-                    entry["split_after"] = True
+                    entry[
+                        "split_after"
+                    ] = True
                 else:
-                    entry["split_after"] = False
+                    entry[
+                        "split_after"
+                    ] = False
 
                 position = (
-                    data_offset + pack_size
+                    data_offset
+                    + pack_size
                 )
 
                 continue
@@ -437,7 +701,10 @@ class RemoteRARArchive:
 
         return result
 
-    def open_cbz(self, entry):
+    def open_cbz(
+        self,
+        entry,
+    ):
         """Open a CBZ stored inside the RAR."""
 
         return RemoteCBZArchive(
