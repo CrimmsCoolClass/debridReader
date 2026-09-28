@@ -12,38 +12,22 @@ from remotezip import RemoteRARArchive
 
 
 class OpenPDFWorker(QObject):
-    """
-    Worker responsible for opening a PDF stored inside
-    a Real-Debrid RAR archive.
-
-    This is intentionally separate from OpenVolumeWorker
-    so the existing CBZ code does not need to know about
-    PDFs.
-    """
 
     finished = Signal(object)
     failed = Signal(str)
     progress = Signal(str)
+    pdfs_found = Signal(object)
 
     def __init__(self, realdebrid):
         super().__init__()
-
         self.realdebrid = realdebrid
 
     @Slot(str, str)
-    def open_pdf(
-        self,
-        torrent_id,
-        selected_name,
-    ):
+    def open_pdf(self, torrent_id, selected_name):
         remote_file = None
         pdf = None
 
         try:
-            # --------------------------------------------------
-            # Get torrent information
-            # --------------------------------------------------
-
             self.progress.emit(
                 "Getting torrent information..."
             )
@@ -52,19 +36,12 @@ class OpenPDFWorker(QObject):
                 torrent_id
             )
 
-            links = info.get(
-                "links",
-                [],
-            )
+            links = info.get("links", [])
 
             if not links:
                 raise RuntimeError(
                     "Torrent has no downloadable links."
                 )
-
-            # --------------------------------------------------
-            # Get Real-Debrid download link
-            # --------------------------------------------------
 
             self.progress.emit(
                 "Getting download link..."
@@ -76,23 +53,11 @@ class OpenPDFWorker(QObject):
                 )
             )
 
-            download_url = unrestricted[
-                "download"
-            ]
-
-            filename = unrestricted[
-                "filename"
-            ]
-
+            download_url = unrestricted["download"]
+            filename = unrestricted["filename"]
             file_size = int(
-                unrestricted[
-                    "filesize"
-                ]
+                unrestricted["filesize"]
             )
-
-            # --------------------------------------------------
-            # Make the outer RAR remotely accessible
-            # --------------------------------------------------
 
             remote_file = RemoteFile(
                 download_url,
@@ -101,137 +66,152 @@ class OpenPDFWorker(QObject):
                 block_size=4 * 1024 * 1024,
             )
 
+            lower_filename = filename.lower()
+
             # --------------------------------------------------
-            # Verify that Real-Debrid gave us a RAR
+            # Case 1:
+            # Real-Debrid gave us a standalone PDF.
             # --------------------------------------------------
 
-            if not filename.lower().endswith(
-                ".rar"
-            ):
-                raise RuntimeError(
-                    "Expected a RAR download from "
-                    "Real-Debrid, but received: "
-                    f"{filename}"
+            if lower_filename.endswith(".pdf"):
+
+                self.progress.emit(
+                    "Opening PDF..."
                 )
 
-            # --------------------------------------------------
-            # Scan the RAR
-            #
-            # This uses the existing lightweight RAR scanner.
-            # It only reads RAR headers and does not download
-            # the PDF contents.
-            # --------------------------------------------------
+                pdf = RemotePDF(
+                    remote_file,
+                    0,
+                    file_size,
+                )
 
-            self.progress.emit(
-                "Scanning RAR archive..."
-            )
+                page_count = pdf.page_count
 
-            rar = RemoteRARArchive(
-                remote_file
-            )
-
-            entries = rar.entries
-
-            # --------------------------------------------------
-            # Find the requested PDF
-            # --------------------------------------------------
-
-            selected_basename = (
-                os.path.basename(
-                    selected_name
-                ).lower()
-            )
-
-            selected_entry = None
-
-            for entry in entries:
-
-                entry_filename = os.path.basename(
-                    entry["filename"]
-                ).lower()
-
-                if (
-                    entry_filename
-                    == selected_basename
-                    and entry_filename.endswith(
-                        ".pdf"
+                if page_count <= 0:
+                    raise RuntimeError(
+                        "The PDF contains no pages."
                     )
-                ):
-                    selected_entry = entry
-                    break
+
+                self.progress.emit(
+                    f"PDF opened: {page_count} pages"
+                )
+
+                self.finished.emit(pdf)
+
+                # Ownership has now been transferred
+                # to the PDF reader.
+                pdf = None
+                remote_file = None
+
+                return
 
             # --------------------------------------------------
-            # If the exact filename wasn't found, try matching
-            # by filename alone. This is useful if the caller
-            # supplied a path while the RAR stores only a
-            # basename.
+            # Case 2:
+            # Real-Debrid gave us a RAR containing the PDF.
             # --------------------------------------------------
 
-            if selected_entry is None:
+            if lower_filename.endswith(".rar"):
+
+                self.progress.emit(
+                    "Scanning RAR archive..."
+                )
+
+                rar = RemoteRARArchive(
+                    remote_file
+                )
+
+                entries = rar.entries
+
+                selected_basename = (
+                    os.path.basename(
+                        selected_name
+                    ).lower()
+                )
+
+                selected_entry = None
 
                 for entry in entries:
-
-                    entry_filename = os.path.basename(
-                        entry["filename"]
-                    ).lower()
+                    entry_filename = (
+                        os.path.basename(
+                            entry["filename"]
+                        ).lower()
+                    )
 
                     if (
                         entry_filename
                         == selected_basename
+                        and entry_filename.endswith(
+                            ".pdf"
+                        )
                     ):
                         selected_entry = entry
                         break
 
-            if selected_entry is None:
-                raise RuntimeError(
-                    "Could not find the selected "
-                    f"PDF inside the RAR: "
-                    f"{selected_name}"
+                # If an exact basename match was not
+                # found, try the complete stored name.
+                if selected_entry is None:
+                    selected_name_lower = (
+                        selected_name.lower()
+                    )
+
+                    for entry in entries:
+                        entry_filename = (
+                            entry["filename"]
+                            .lower()
+                        )
+
+                        if (
+                            entry_filename
+                            == selected_name_lower
+                        ):
+                            selected_entry = entry
+                            break
+
+                if selected_entry is None:
+                    raise RuntimeError(
+                        "Could not find the selected PDF "
+                        "inside the RAR: "
+                        f"{selected_name}"
+                    )
+
+                self.progress.emit(
+                    "Opening PDF..."
                 )
 
-            # --------------------------------------------------
-            # Open the PDF directly from its RAR byte range
-            # --------------------------------------------------
-
-            self.progress.emit(
-                "Opening PDF..."
-            )
-
-            pdf = RemotePDF(
-                remote_file,
-                selected_entry["offset"],
-                selected_entry["size"],
-            )
-
-            # --------------------------------------------------
-            # Make sure PyMuPDF successfully opened it
-            # --------------------------------------------------
-
-            page_count = pdf.page_count
-
-            if page_count <= 0:
-                raise RuntimeError(
-                    "The PDF contains no pages."
+                pdf = RemotePDF(
+                    remote_file,
+                    selected_entry["offset"],
+                    selected_entry["size"],
                 )
 
-            self.progress.emit(
-                f"PDF opened: {page_count} pages"
-            )
+                page_count = pdf.page_count
+
+                if page_count <= 0:
+                    raise RuntimeError(
+                        "The PDF contains no pages."
+                    )
+
+                self.progress.emit(
+                    f"PDF opened: {page_count} pages"
+                )
+
+                self.finished.emit(pdf)
+
+                # Ownership has now been transferred
+                # to the PDF reader.
+                pdf = None
+                remote_file = None
+
+                return
 
             # --------------------------------------------------
-            # Return the PDF object.
-            #
-            # The worker deliberately does NOT close
-            # remote_file here because RemotePDF needs it
-            # while the document remains open.
+            # Unsupported download type.
             # --------------------------------------------------
 
-            self.finished.emit(
-                pdf
+            raise RuntimeError(
+                "Unsupported Real-Debrid download type: "
+                f"{filename}"
             )
-
-            pdf = None
-            remote_file = None
 
         except Exception as error:
 
@@ -240,6 +220,132 @@ class OpenPDFWorker(QObject):
                     pdf.close()
                 except Exception:
                     pass
+
+            if remote_file is not None:
+                try:
+                    remote_file.close()
+                except Exception:
+                    pass
+
+            self.failed.emit(
+                str(error)
+            )
+
+    @Slot(str)
+    def scan_pdfs(self, torrent_id):
+        remote_file = None
+
+        try:
+            self.progress.emit(
+                "Getting torrent information..."
+            )
+
+            info = self.realdebrid.get_torrent_info(
+                torrent_id
+            )
+
+            links = info.get("links", [])
+
+            if not links:
+                raise RuntimeError(
+                    "Torrent has no downloadable links."
+                )
+
+            self.progress.emit(
+                "Getting download link..."
+            )
+
+            unrestricted = (
+                self.realdebrid.unrestrict_link(
+                    links[0]
+                )
+            )
+
+            download_url = unrestricted["download"]
+            filename = unrestricted["filename"]
+            file_size = int(
+                unrestricted["filesize"]
+            )
+
+            remote_file = RemoteFile(
+                download_url,
+                file_size,
+                cache_size=500 * 1024 * 1024,
+                block_size=4 * 1024 * 1024,
+            )
+
+            lower_filename = filename.lower()
+
+            # --------------------------------------------------
+            # Standalone PDF
+            # --------------------------------------------------
+
+            if lower_filename.endswith(".pdf"):
+
+                pdfs = [
+                    {
+                        "filename": filename,
+                        "offset": 0,
+                        "size": file_size,
+                    }
+                ]
+
+                self.pdfs_found.emit(
+                    pdfs
+                )
+
+                remote_file.close()
+
+                return
+
+            # --------------------------------------------------
+            # PDF(s) inside RAR
+            # --------------------------------------------------
+
+            if lower_filename.endswith(".rar"):
+
+                self.progress.emit(
+                    "Scanning RAR for PDFs..."
+                )
+
+                rar = RemoteRARArchive(
+                    remote_file
+                )
+
+                pdfs = []
+
+                for entry in rar.entries:
+
+                    name = entry.get(
+                        "filename",
+                        "",
+                    )
+
+                    if name.lower().endswith(
+                        ".pdf"
+                    ):
+                        pdfs.append(
+                            {
+                                "filename": name,
+                                "offset": entry["offset"],
+                                "size": entry["size"],
+                            }
+                        )
+
+                self.pdfs_found.emit(
+                    pdfs
+                )
+
+                remote_file.close()
+
+                return
+
+            raise RuntimeError(
+                "Unsupported Real-Debrid download type: "
+                f"{filename}"
+            )
+
+        except Exception as error:
 
             if remote_file is not None:
                 try:

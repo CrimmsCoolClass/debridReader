@@ -21,14 +21,29 @@ from PySide6.QtWidgets import (
 )
 
 from reading_progress import ReadingProgress
+from ui.pdf_reader_window import PDFReaderWindow
 from ui.reader_window import ReaderWindow
+from workers.open_pdf import OpenPDFWorker
 from workers.open_volume import OpenVolumeWorker
 
 
 class LibraryWindow(QMainWindow):
 
+    # ========================================================
+    # Worker signals
+    # ========================================================
+
     open_volume_requested = Signal(
         str,
+        str,
+    )
+
+    open_pdf_requested = Signal(
+        str,
+        str,
+    )
+
+    scan_pdfs_requested = Signal(
         str,
     )
 
@@ -73,6 +88,50 @@ class LibraryWindow(QMainWindow):
         self.open_worker_thread.start()
 
         # ====================================================
+        # Open-PDF worker
+        # ====================================================
+
+        self.open_pdf_worker_thread = QThread(
+            self
+        )
+
+        self.open_pdf_worker = OpenPDFWorker(
+            self.realdebrid
+        )
+
+        self.open_pdf_worker.moveToThread(
+            self.open_pdf_worker_thread
+        )
+
+        self.open_pdf_requested.connect(
+            self.open_pdf_worker.open_pdf,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        self.scan_pdfs_requested.connect(
+            self.open_pdf_worker.scan_pdfs,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        self.open_pdf_worker.finished.connect(
+            self.pdf_opened
+        )
+
+        self.open_pdf_worker.failed.connect(
+            self.pdf_open_failed
+        )
+
+        self.open_pdf_worker.progress.connect(
+            self.pdf_open_progress
+        )
+
+        self.open_pdf_worker.pdfs_found.connect(
+            self.pdfs_found
+        )
+
+        self.open_pdf_worker_thread.start()
+
+        # ====================================================
         # State
         # ====================================================
 
@@ -81,6 +140,7 @@ class LibraryWindow(QMainWindow):
         self.current_torrent = None
         self.current_info = None
         self.current_volume_name = None
+        self.current_pdf_name = None
 
         self.remote_file = None
         self.remote_rar = None
@@ -90,6 +150,7 @@ class LibraryWindow(QMainWindow):
         self.reading_progress = ReadingProgress()
 
         self.reader = None
+        self.pdf_reader = None
 
         # When a volume reaches its final page, the reader
         # closes and this stores the next volume to open.
@@ -644,21 +705,31 @@ class LibraryWindow(QMainWindow):
         if lower_name.endswith(
             ".torrent"
         ):
+
             name = name[:-8]
 
         elif lower_name.endswith(
             ".rar"
         ):
+
             name = name[:-4]
 
         elif lower_name.endswith(
             ".cbz"
         ):
+
             name = name[:-4]
 
         elif lower_name.endswith(
             ".zip"
         ):
+
+            name = name[:-4]
+
+        elif lower_name.endswith(
+            ".pdf"
+        ):
+
             name = name[:-4]
 
         return name.strip()
@@ -727,12 +798,12 @@ class LibraryWindow(QMainWindow):
         if self.current_torrent is None:
             return
 
-        if not self.current_volume_name:
-            return
-
         torrent_id = (
             self.current_torrent["id"]
         )
+
+        if not self.current_volume_name:
+            return
 
         self.pending_next_volume = None
 
@@ -873,13 +944,108 @@ class LibraryWindow(QMainWindow):
 
             self.status_label.setText(
                 f"{len(cbz_files)} volumes — "
-                "download link available"
+                "scanning for PDFs..."
+            )
+
+            if self.current_torrent is None:
+
+                self.status_label.setText(
+                    "Unable to determine current torrent."
+                )
+
+                return
+
+            torrent_id = (
+                self.current_torrent["id"]
+            )
+
+            self.scan_pdfs_requested.emit(
+                torrent_id
             )
 
         else:
 
             self.status_label.setText(
                 "No downloadable links"
+            )
+
+    # ========================================================
+    # PDF discovery callback
+    # ========================================================
+
+    def pdfs_found(
+        self,
+        pdfs,
+    ):
+
+        if self.current_torrent is None:
+            return
+
+        for pdf in pdfs:
+
+            filename = pdf.get(
+                "filename",
+                "",
+            )
+
+            if not filename:
+                continue
+
+            item = QListWidgetItem(
+                self.clean_volume_name(
+                    filename
+                )
+            )
+
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {
+                    "path": filename,
+                    "pdf": pdf,
+                },
+            )
+
+            item.setData(
+                Qt.ItemDataRole.UserRole + 1,
+                "pdf",
+            )
+
+            self.volume_list.addItem(
+                item
+            )
+
+        cbz_count = 0
+        pdf_count = 0
+
+        for index in range(
+            self.volume_list.count()
+        ):
+
+            item = self.volume_list.item(
+                index
+            )
+
+            item_type = item.data(
+                Qt.ItemDataRole.UserRole + 1
+            )
+
+            if item_type == "torrent_file":
+                cbz_count += 1
+
+            elif item_type == "pdf":
+                pdf_count += 1
+
+        if pdf_count:
+
+            self.status_label.setText(
+                f"{cbz_count} volumes, "
+                f"{pdf_count} PDFs"
+            )
+
+        else:
+
+            self.status_label.setText(
+                f"{cbz_count} volumes"
             )
 
     # ========================================================
@@ -909,7 +1075,7 @@ class LibraryWindow(QMainWindow):
         )
 
     # ========================================================
-    # Open volume
+    # Open volume / PDF
     # ========================================================
 
     def open_volume(
@@ -920,30 +1086,29 @@ class LibraryWindow(QMainWindow):
         if self.current_torrent is None:
             return
 
+        item_type = item.data(
+            Qt.ItemDataRole.UserRole + 1
+        )
+
         selected_file = item.data(
             Qt.ItemDataRole.UserRole
         )
 
-        selected_name = ""
+        if selected_file is None:
+            return
 
-        if selected_file is not None:
-
-            selected_name = selected_file.get(
-                "path",
-                "",
-            )
+        selected_name = selected_file.get(
+            "path",
+            "",
+        )
 
         if not selected_name:
 
             self.status_label.setText(
-                "Unable to determine selected volume."
+                "Unable to determine selected file."
             )
 
             return
-
-        self.current_volume_name = (
-            selected_name
-        )
 
         torrent_id = (
             self.current_torrent["id"]
@@ -957,6 +1122,35 @@ class LibraryWindow(QMainWindow):
 
         self.open_button.setEnabled(
             False
+        )
+
+        # ====================================================
+        # PDF
+        # ====================================================
+
+        if item_type == "pdf":
+
+            self.current_pdf_name = (
+                selected_name
+            )
+
+            self.status_label.setText(
+                "Opening PDF..."
+            )
+
+            self.open_pdf_requested.emit(
+                torrent_id,
+                selected_name,
+            )
+
+            return
+
+        # ====================================================
+        # CBZ volume
+        # ====================================================
+
+        self.current_volume_name = (
+            selected_name
         )
 
         self.status_label.setText(
@@ -1081,6 +1275,90 @@ class LibraryWindow(QMainWindow):
         self.status_label.setText(
             "Volume opened"
         )
+
+    # ========================================================
+    # PDF worker callbacks
+    # ========================================================
+
+    def pdf_open_progress(
+        self,
+        message,
+    ):
+
+        self.status_label.setText(
+            message
+        )
+
+    def pdf_open_failed(
+        self,
+        error,
+    ):
+
+        self.volume_list.setEnabled(
+            True
+        )
+
+        self.open_button.setEnabled(
+            True
+        )
+
+        self.status_label.setText(
+            f"Failed to open PDF: {error}"
+        )
+
+        QMessageBox.critical(
+            self,
+            "Open PDF",
+            str(error),
+        )
+
+    def pdf_opened(
+        self,
+        pdf,
+    ):
+
+        self.volume_list.setEnabled(
+            True
+        )
+
+        self.open_button.setEnabled(
+            True
+        )
+
+        reader = PDFReaderWindow(
+            pdf
+        )
+
+        reader.closed.connect(
+            self.pdf_reader_closed
+        )
+
+        reader.show()
+
+        self.pdf_reader = reader
+
+        self.status_label.setText(
+            "PDF opened"
+        )
+
+    def pdf_reader_closed(self):
+
+        self.pdf_reader = None
+
+        self.current_pdf_name = None
+
+        if (
+            self.current_view
+            == "currently_reading"
+        ):
+
+            self.populate_currently_reading()
+
+        else:
+
+            self.status_label.setText(
+                "Ready"
+            )
 
     # ========================================================
     # Volume completion / next volume
@@ -1228,6 +1506,18 @@ class LibraryWindow(QMainWindow):
 
         if next_volume:
 
+            if self.current_torrent is None:
+
+                self.status_label.setText(
+                    "Unable to open next volume."
+                )
+
+                return
+
+            torrent_id = (
+                self.current_torrent["id"]
+            )
+
             self.current_volume_name = (
                 next_volume
             )
@@ -1237,7 +1527,7 @@ class LibraryWindow(QMainWindow):
             )
 
             self.open_volume_requested.emit(
-                self.current_torrent["id"],
+                torrent_id,
                 next_volume,
             )
 
@@ -1283,6 +1573,12 @@ class LibraryWindow(QMainWindow):
 
             name = name[:-4]
 
+        elif lower_name.endswith(
+            ".pdf"
+        ):
+
+            name = name[:-4]
+
         return name.strip()
 
     # ========================================================
@@ -1298,5 +1594,8 @@ class LibraryWindow(QMainWindow):
 
         self.open_worker_thread.wait()
 
-        event.accept()
+        self.open_pdf_worker_thread.quit()
 
+        self.open_pdf_worker_thread.wait()
+
+        event.accept()

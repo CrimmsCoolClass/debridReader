@@ -1,18 +1,9 @@
 import io
 
-import fitz
+import pypdfium2 as pdfium
 
 
 class RemotePDFFile(io.RawIOBase):
-    """
-    Seekable view of a PDF stored inside a RemoteFile.
-
-    offset:
-        Absolute byte offset of the PDF data inside the outer RAR.
-
-    size:
-        Size of the PDF data.
-    """
 
     def __init__(
         self,
@@ -27,7 +18,14 @@ class RemotePDFFile(io.RawIOBase):
         self.size = size
         self.position = 0
 
-    def read(self, size=-1):
+    # ========================================================
+    # Reading
+    # ========================================================
+
+    def read(
+        self,
+        size=-1,
+    ):
         if self.position >= self.size:
             return b""
 
@@ -51,35 +49,63 @@ class RemotePDFFile(io.RawIOBase):
 
         return data
 
+    def readinto(
+        self,
+        buffer,
+    ):
+        data = self.read(
+            len(buffer)
+        )
+
+        length = len(data)
+
+        buffer[:length] = data
+
+        return length
+
+    # ========================================================
+    # Seeking
+    # ========================================================
+
     def seek(
         self,
         offset,
         whence=0,
     ):
         if whence == 0:
+
             new_position = offset
 
         elif whence == 1:
+
             new_position = (
-                self.position + offset
+                self.position
+                + offset
             )
 
         elif whence == 2:
+
             new_position = (
-                self.size + offset
+                self.size
+                + offset
             )
 
         else:
+
             raise ValueError(
                 "Invalid whence"
             )
 
         if new_position < 0:
+
             raise ValueError(
                 "Negative seek position"
             )
 
-        self.position = new_position
+        self.position = min(
+            new_position,
+            self.size,
+        )
 
         return self.position
 
@@ -94,14 +120,6 @@ class RemotePDFFile(io.RawIOBase):
 
 
 class RemotePDF:
-    """
-    PDF stored inside a remote RAR archive.
-
-    The PDF is never downloaded as a complete file.
-    PyMuPDF reads it through RemotePDFFile, which
-    ultimately reads through RemoteFile's HTTP
-    Range-request cache.
-    """
 
     def __init__(
         self,
@@ -119,24 +137,29 @@ class RemotePDF:
             size,
         )
 
-        self.document = fitz.open(
-            stream=self.file,
-            filetype="pdf",
+        self.document = pdfium.PdfDocument(
+            self.file
         )
+
+    # ========================================================
+    # Information
+    # ========================================================
 
     @property
     def page_count(self):
-        return self.document.page_count
+        return len(
+            self.document
+        )
+
+    # ========================================================
+    # Rendering
+    # ========================================================
 
     def render_page(
         self,
         page_number,
         scale=1.5,
     ):
-        """
-        Render a PDF page and return PNG bytes.
-        """
-
         if (
             page_number < 0
             or page_number >= self.page_count
@@ -145,26 +168,43 @@ class RemotePDF:
                 "PDF page number out of range"
             )
 
-        page = self.document.load_page(
+        page = self.document[
             page_number
+        ]
+
+        bitmap = page.render(
+            scale=scale
         )
 
-        matrix = fitz.Matrix(
-            scale,
-            scale,
+        pil_image = bitmap.to_pil()
+
+        output = io.BytesIO()
+
+        pil_image.save(
+            output,
+            format="PNG",
         )
 
-        pixmap = page.get_pixmap(
-            matrix=matrix,
-            alpha=False,
-        )
+        return output.getvalue()
 
-        return pixmap.tobytes(
-            "png"
-        )
+    # ========================================================
+    # Closing
+    # ========================================================
 
     def close(self):
-        self.document.close()
+
+        if self.document is not None:
+
+            self.document.close()
+
+            self.document = None
+
+        self.file = None
+
+    # ========================================================
+    # Cache information
+    # ========================================================
 
     def get_cache_info(self):
+
         return self.remote_file.get_cache_info()
